@@ -1,99 +1,109 @@
-from airflow import DAG
-from datetime import timedelta, datetime
-from airflow.providers.http.sensors.http import HttpSensor
-import json
-from airflow.providers.http.operators.http import SimpleHttpOperator
-from airflow.operators.python import PythonOperator
-import pandas as pd
+import requests
+import time
+import csv
+import boto3
+from botocore.exceptions import NoCredentialsError
 
+# Replace 'YOUR_API_KEY' with your OpenWeatherMap API key
+API_KEY = 'YOUR_API_KEY'
 
+# List of city IDs and city names for multiple cities
+CITIES = [
+    {"id": 1259229, "name": "Pune, IN"},
+    {"id": 2643743, "name": "London, UK"},
+    # Add more cities as needed in the same format
+]
 
+# OpenWeatherMap API URL
+API_BASE_URL = 'http://api.openweathermap.org/data/2.5/weather?id={city_id}&appid={api_key}'
 
-def kelvin_to_fahrenheit(temp_in_kelvin):
-    temp_in_fahrenheit = (temp_in_kelvin - 273.15) * (9/5) + 32
-    return temp_in_fahrenheit
+# AWS S3 configuration
+AWS_ACCESS_KEY_ID = 'YOUR_ACCESS_KEY_ID'
+AWS_SECRET_ACCESS_KEY = 'YOUR_SECRET_ACCESS_KEY'
+S3_BUCKET_NAME = 'your-s3-bucket-name'
+S3_OBJECT_KEY = 'weather_data.csv'  # Name of the CSV file in S3
 
+# Get the current time as the start time
+start_time = time.time()
 
-def transform_load_data(task_instance):
-    data = task_instance.xcom_pull(task_ids="extract_weather_data")
-    city = data["name"]
-    weather_description = data["weather"][0]['description']
-    temp_farenheit = kelvin_to_fahrenheit(data["main"]["temp"])
-    feels_like_farenheit= kelvin_to_fahrenheit(data["main"]["feels_like"])
-    min_temp_farenheit = kelvin_to_fahrenheit(data["main"]["temp_min"])
-    max_temp_farenheit = kelvin_to_fahrenheit(data["main"]["temp_max"])
-    pressure = data["main"]["pressure"]
-    humidity = data["main"]["humidity"]
-    wind_speed = data["wind"]["speed"]
-    time_of_record = datetime.utcfromtimestamp(data['dt'] + data['timezone'])
-    sunrise_time = datetime.utcfromtimestamp(data['sys']['sunrise'] + data['timezone'])
-    sunset_time = datetime.utcfromtimestamp(data['sys']['sunset'] + data['timezone'])
+# Define the duration in seconds (8 hours)
+duration = 8 * 3600  # 8 hours * 3600 seconds/hour
 
-    transformed_data = {"City": city,
-                        "Description": weather_description,
-                        "Temperature (F)": temp_farenheit,
-                        "Feels Like (F)": feels_like_farenheit,
-                        "Minimun Temp (F)":min_temp_farenheit,
-                        "Maximum Temp (F)": max_temp_farenheit,
-                        "Pressure": pressure,
-                        "Humidty": humidity,
-                        "Wind Speed": wind_speed,
-                        "Time of Record": time_of_record,
-                        "Sunrise (Local Time)":sunrise_time,
-                        "Sunset (Local Time)": sunset_time                        
-                        }
-    transformed_data_list = [transformed_data]
-    df_data = pd.DataFrame(transformed_data_list)
-    aws_credentials = {"key": "xxxxxxxxx", "secret": "xxxxxxxxxx", "token": "xxxxxxxxxxxxxx"}
+# Create a dictionary to store weather data for each city
+city_weather_data = {city['name']: [] for city in CITIES}
 
-    now = datetime.now()
-    dt_string = now.strftime("%d%m%Y%H%M%S")
-    dt_string = 'current_weather_data_portland_' + dt_string
-    df_data.to_csv(f"s3://weatherapiairflowyoutubebucket-yml/{dt_string}.csv", index=False, storage_options=aws_credentials)
+while True:
+    try:
+        for city in CITIES:
+            # Make a GET request to OpenWeatherMap API for each city
+            api_url = API_BASE_URL.format(city_id=city['id'], api_key=API_KEY)
+            response = requests.get(api_url)
+            
+            # Check if the request was successful (status code 200)
+            if response.status_code == 200:
+                weather_data = response.json()
+                
+                # Extract relevant weather information
+                temperature = weather_data['main']['temp']
+                humidity = weather_data['main']['humidity']
+                description = weather_data['weather'][0]['description']
+                
+                # Append data for the city to the dictionary
+                city_weather_data[city['name']].append({
+                    'Time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                    'Temperature (°C)': temperature,
+                    'Humidity (%)': humidity,
+                    'Condition': description
+                })
+            else:
+                print(f'Failed to fetch data for {city["name"]}. Status code: {response.status_code}')
+        
+        # Check if 8 hours have passed, and if so, exit the loop
+        if time.time() - start_time >= duration:
+            break
+        
+        # Wait for 30 minutes before fetching data again (you can adjust this interval)
+        time.sleep(1800)  # 1800 seconds = 30 minutes
+        
+    except Exception as e:
+        print(f'An error occurred: {str(e)}')
 
+# Create or append to a CSV file locally
+with open('weather_data.csv', 'a', newline='') as csvfile:
+    fieldnames = ['Time'] + [city['name'] for city in CITIES]
+    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    
+    # Write the header if the file is empty
+    if csvfile.tell() == 0:
+        writer.writeheader()
+    
+    # Write the weather data for each city to the CSV file
+    while True:
+        try:
+            data_row = {'Time': ''}
+            for city in CITIES:
+                if city_weather_data[city['name']]:
+                    data_row[city['name']] = city_weather_data[city['name']].pop(0)
+                else:
+                    data_row[city['name']] = ''
+            
+            writer.writerow(data_row)
+            
+            # Upload the CSV file to S3
+            s3 = boto3.client('s3', aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
+            s3.upload_file('weather_data.csv', S3_BUCKET_NAME, S3_OBJECT_KEY)
+            
+            print(f'Data saved to S3 bucket: {S3_BUCKET_NAME}/{S3_OBJECT_KEY}')
+            
+            # Check if 8 hours have passed, and if so, exit the loop
+            if time.time() - start_time >= duration:
+                break
+            
+            # Wait for 30 minutes before writing data again (you can adjust this interval)
+            time.sleep(1800)  # 1800 seconds = 30 minutes
+        
+        except Exception as e:
+            print(f'An error occurred: {str(e)}')
 
+# The code will exit after 8 hours of execution.
 
-default_args = {
-    'owner': 'airflow',
-    'depends_on_past': False,
-    'start_date': datetime(2023, 1, 8),
-    'email': ['myemail@domain.com'],
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': 2,
-    'retry_delay': timedelta(minutes=2)
-}
-
-
-
-with DAG('weather_dag',
-        default_args=default_args,
-        schedule_interval = '@daily',
-        catchup=False) as dag:
-
-
-        is_weather_api_ready = HttpSensor(
-        task_id ='is_weather_api_ready',
-        http_conn_id='weathermap_api',
-        endpoint='/data/2.5/weather?q=Portland&APPID=5031cde3d1a8b9469fd47e998d7aef79'
-        )
-
-
-        extract_weather_data = SimpleHttpOperator(
-        task_id = 'extract_weather_data',
-        http_conn_id = 'weathermap_api',
-        endpoint='/data/2.5/weather?q=Portland&APPID=5031cde3d1a8b9469fd47e998d7aef79',
-        method = 'GET',
-        response_filter= lambda r: json.loads(r.text),
-        log_response=True
-        )
-
-        transform_load_weather_data = PythonOperator(
-        task_id= 'transform_load_weather_data',
-        python_callable=transform_load_data
-        )
-
-
-
-
-        is_weather_api_ready >> extract_weather_data >> transform_load_weather_data
